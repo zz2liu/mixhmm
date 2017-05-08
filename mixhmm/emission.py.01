@@ -1,0 +1,146 @@
+"""emission.py - Emission class
+
+Implementation notes:
+    K, k: number/index of states
+    T, t: number/index of loci.
+
+06/09/09 created from Ao's drafts.
+06/10/09 put mix_lrr and mix_baf in the end of __init__ and update only.
+
+todo: calc_baf_posts return baf_posts and het_probs
+todo: if w = 0, cn_mix can be 0, and mix_het misbehave!
+"""
+from scipy.stats import norm
+from numpy import sum, array, array_split, subtract
+from py_cna._sidcon import lrrs_from_cn
+
+HOM, HET = 0, 1
+class Emission(object):
+    def __init__(self, w, lrr_offset,
+            cns, lrr_vars,
+            baf_means, baf_vars,
+            cn_stroma=2, stroma_baf=[0, 0.5]):
+        """init an emission.
+
+        w: proportion of stroma. will be updated
+        lrr_offset: lrr baseline, will be updated
+        cns: copy numbers of each state -> lrr_means [K]
+        lrr_vars: [K]
+        baf_means: baf means of each state, each gtype [K x 2]
+        baf_vars: [Kx2]
+        cn_stroma: stromal copynumber. -> stroma_lrr
+        stroma_baf: stromal baf means (het, hom) [2]
+        """
+        self._cns = cns
+        self._lrr_offset = lrr_offset
+        self._lrr_vars = lrr_vars
+
+        self._baf_means = baf_means
+        self._baf_vars = baf_vars
+
+        self._w = w
+        self._cn_stroma = cn_stroma
+        self._stroma_baf = stroma_baf
+
+        ## prepare lrr_mix and baf_mix for efficiency
+        self._cn_mix, self._lrr_mix = self._mix_lrr()
+        self._het_mix =  self._mix_het(self._cn_mix)
+
+    def prob(self, obs):
+        """calc the likelihood of observing obs, give each state.
+        for space efficiency and fit well to E in baum_train module.
+        """
+        lrr, baf, pB = obs
+        lrr_posts = self._calc_lrr_posts(lrr)
+        hom_posts, het_posts = self._calc_baf_posts(baf, pB)
+        #print lrr, baf, pB, lrr_posts, hom_posts, het_posts
+        return lrr_posts * (hom_posts + het_posts)
+    __call__ = prob
+
+    def all_probs(self, observations):
+        """calc emission probability [T, K] and post prob of from het [T,K]
+        for time efficiency
+
+        - observations: of [T x 3], each row as (lrr, baf, pB)
+        """
+        lrr, baf, pB = array_split(observations, 3, axis=1) #[T, 1]
+        lrr_posts = self._calc_lrr_posts(lrr) #[T, K]
+        hom_posts, het_posts = self._calc_baf_posts(baf, pB)
+        baf_posts = hom_posts + het_posts
+        return lrr_posts * baf_posts, het_posts / baf_posts  #[T, K]
+
+
+    ## cound take too much memory
+    def update(self, gamma, observations, het_probs=None):
+        """update the emission parameters from gamma.
+
+        gamma: [T x K] prob of being in state k at time t
+        het_posts: [T x K] posterior probability of from het genotypes.
+        """
+        cn_stroma, het_stroma = self._cn_stroma, self._stroma_baf[HET]
+        cns, hets = self._cns, self._baf_means[:, HET] #[K]
+        lrr_offset = self._lrr_offset
+        cn_mix, lrr_mix, het_mix = self._cn_mix, self._lrr_mix, self._het_mix
+
+        lrr, baf, pB = array_split(observations, 3, axis=1) #[T, 1]
+        if not het_probs:
+            hom_posts, het_posts = self._calc_baf_posts(baf, pB)
+            het_probs = het_posts/(hom_posts + het_posts)
+        hom_probs = 1-het_probs #[T, K]
+
+        gamma_sum = gamma.sum() #for performance
+        #mix lrr and update vars and offset
+        tmp = subtract.outer(lrr, lrr_mix+lrr_offset) ** 2 #[T, K]
+        self._lrr_vars[0:] = sum(gamma * tmp) / gamma_sum
+            #change all the vars except the first one
+        tmp = subtract.outer(lrr, lrr_mix) #[T, K]
+        self._lrr_offset = sum(gamma * tmp) / gamma_sum
+
+        # update baf_vars #not right
+        het_ss = het_probs * subtract.outer(baf, het_mix) ** 2 # [T, K]
+        hom_ss = hom_probs * baf ** 2 # [T, K] # hom_mix are 0
+        self._baf_vars = sum(gamma * (het_ss + hom_ss))/ gamma_sum
+
+        ## update w
+        tmp = (cn_stroma * het_stroma - cns * hets)/cn_mix #[K]
+        gamma_ = gamma * het_probs #calc w only from het_bafs
+        self._w = sum(gamma_ * tmp * subtract.outer(baf, cns * hets/cn_mix))\
+                        / sum(gamma_ * tmp **2)
+
+        #####
+        ## update lrr_mix and baf_mix as w updated
+        self._cn_mix, self._lrr_mix = self._mix_lrr()
+        self._het_mix =  self._mix_het(cn_mix)
+
+    def _mix_lrr(self):
+        """calc mixed copynumber and mixed lrr as [K], [K]
+        """
+        w, cn_stroma, cns = self._w, self._cn_stroma, self._cns
+        cn_mix = w * cn_stroma + (1-w) * cns #[K]
+        lrr_mix = lrrs_from_cn(cn_mix) #[K]
+        return cn_mix, lrr_mix
+
+    def _mix_het(self, cn_mix):
+        """calc the mixed het baf exps as [K].
+        """
+        w, cns = self._w, self._cns
+        cn_stroma, stroma_het = self._cn_stroma, self._stroma_baf[HET]
+        het_means = self._baf_means[:, HET]
+
+        return ((1-w)*cns*het_means + w*cn_stroma*stroma_het) / cn_mix
+
+    def _calc_baf_posts(self, baf, pB):
+        """calc baf posterior lik -> (hom_posts, het_posts)
+        """
+        het_pdf = norm(self._het_mix, self._baf_vars[:, HET]).pdf
+        hom_pdf = norm(self._baf_means[:, HOM], self._baf_vars[:, HOM]).pdf
+        pA = 1-pB
+        hom_posts = hom_pdf(baf) * (pA*pA + pB*pB)
+        het_posts = het_pdf(baf) * 2*pA*pB
+        return hom_posts, het_posts
+
+    def _calc_lrr_posts(self, lrr):
+        lrr_pdf = norm(self._lrr_mix + self._lrr_offset, self._lrr_vars).pdf #[K]
+        return lrr_pdf(lrr)
+
+

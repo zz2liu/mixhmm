@@ -1,0 +1,3 @@
+fname, gtype, baf, lrr_base, note
+test1.csv, A, 0, 0, p=0 no adjust
+test2.csv, AA, 0.1, -.5, p=~30 lrr+0.5
